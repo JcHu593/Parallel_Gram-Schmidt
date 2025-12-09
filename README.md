@@ -3,7 +3,7 @@
 $f:\{\text{any\ set\ of\ }n\text{\ vectors\ in\ }\mathbb{R}^{n}\}\rightarrow \{\text{orthonormal\ basis\ of\ the\ subspace\ spanned\ by\ the\ input\ vectors}\}$
 - Input format:
     - .txt file
-    - first line: one **integer** (**1 <= n <= 2048**) representing number of vectors involved
+    - first line: one **integer** (**1 <= n <= 4096**) representing number of vectors involved
     - following n lines: each line represinting a vector of n **doubles** ranging **[-10.0, 10.0]**
     - set of the n vectors can be either linearly dependent or independent
 - Output format:
