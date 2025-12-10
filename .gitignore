@@ -1,6 +1,6 @@
 # Executables
-#*.exe
-#*.out
+*.exe
+*.out
 
 # Generated test cases and corresponding outputs
 n*_s*_in.txt
