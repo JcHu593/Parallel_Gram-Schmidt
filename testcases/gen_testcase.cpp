@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <vector>
 #include <omp.h>
+#include <iomanip>
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
@@ -40,6 +41,7 @@ int main(int argc, char* argv[]) {
     }
 
     outfile << n << "\n";
+    //outfile << std::fixed << std::setprecision(6); // Set precision for output
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < n; ++j) {
             outfile << data[i * n + j] << (j == n - 1 ? "" : " ");

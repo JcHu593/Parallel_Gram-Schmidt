@@ -15,9 +15,18 @@ $f:\{\text{any\ set\ of\ }n\text{\ vectors\ in\ }\mathbb{R}^{n}\}\rightarrow \{\
       `./gen_testcase <n> <seed>`
 - Implementaion: e.g.`gs-seq.cc`
     - compilation:<br>
-      `g++ [options] gs-seq.cc -o gs-seq`
+      `g++ -O3 -fopenmp -march=native [other options] gs-seq.cc -o gs-seq`
     - execution:<br>
       `./gs-seq <INPUTFILE> <OUTPUTFILE>` 
 - Answer checker :`./output/check_gs.py`
     - usage:<br>
       `python check_gs.py <INPUTFILE> <OUTPUTFILE>`
+    - result intepretation:<br>
+      - `Orthonormality check PASSED.` -> The non-zero vectors do form an orthonormal (enough) basis.
+      - `Span preservation check PASSED.` -> The spanned space is consistent (enough).
+
+## Optimization
+1) Sequential Modified Gram-Schmidt `gs-seq.cc`
+2) Multi-threaded Modified Gram-Schmidt `gs-mthreads_v1.cc`
+3) Vectorized Multi-threaded Modified Gram-Schmidt `gs-mthreads_v1_v2.cc`
+4) Vectorized Multi-threaded Blocked Modified Gram-Schmidt `gs-bmgs.cc`

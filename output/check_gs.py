@@ -107,15 +107,28 @@ def main():
     TOLERANCE = 1e-2 # Relaxed slightly for larger N and float output precision
     
     # 1. Check Orthonormality
-    print("Checking orthonormality...")
+    print(f"Checking orthonormality (limit: {TOLERANCE})...")
     is_ortho, err_ortho = check_orthonormality(Q, TOLERANCE)
     print(f"Orthonormality Max Error: {err_ortho:.6e}")
+    if is_ortho:
+        print("Orthonormality check PASSED.")
+    else:
+        print("Orthonormality check FAILED.")
     
+    print()
+
     # 2. Check Span Preservation
-    print("Checking span preservation...")
+    print(f"Checking span preservation (limit: {TOLERANCE})...")
     is_span, err_span = check_span_preservation(V, Q, TOLERANCE)
     print(f"Span Preservation Max Error: {err_span:.6e}")
+    if is_span:
+        print("Span preservation check PASSED.")
+    else:
+        print("Span preservation check FAILED.")
     
+    print()
+
+    print("Final Result:")
     if is_ortho and is_span:
         print("VALID")
     else:
