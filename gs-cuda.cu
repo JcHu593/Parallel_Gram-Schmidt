@@ -5,10 +5,9 @@
 #include <iomanip>
 #include <string>
 #include <chrono>
-#include <cuda.h>
+#include <cuda_runtime.h>
 
 #define BLOCK_SIZE 256
-#define MAX_BLOCKS 1024
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
@@ -21,130 +20,128 @@
         } \
     } while(0)
 
-// Kernel to compute dot product of two vectors using reduction
-// Uses a two-phase reduction: first within blocks, then across blocks
-__global__ void dot_product_kernel(const double* a, const double* b, double* block_results, int n, int num_blocks) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int stride = num_blocks * blockDim.x;
+// ----------------------------------------------------------------------
+// Kernel 1: 單一向量的 Dot Product (用於計算自身長度/Norm)
+// 每個 Block 計算一部分，最後由 CPU 或另一個 Kernel 匯總? 
+// 為了效率，我們這裡使用由單一 Block 完成的 Reduction (假設 N < 1024*1024 夠用)
+// 如果 N 非常大，需要多級 Reduction，但此處針對 N=4096 優化
+// ----------------------------------------------------------------------
+__global__ void single_vector_norm_squared_kernel(const double* vec, double* result, int n) {
+    __shared__ double cache[BLOCK_SIZE];
     
-    __shared__ double shared_sum[BLOCK_SIZE];
-    double sum = 0.0;
+    int tid = threadIdx.x;
+    double temp_sum = 0.0;
     
-    // Each thread accumulates its portion
-    for (int i = tid; i < n; i += stride) {
-        sum += a[i] * b[i];
+    // Grid-Stride Loop: 處理 N > BLOCK_SIZE 的情況
+    for (int i = tid; i < n; i += blockDim.x) {
+        temp_sum += vec[i] * vec[i];
     }
     
-    shared_sum[threadIdx.x] = sum;
+    cache[tid] = temp_sum;
     __syncthreads();
     
-    // Reduction within block using warp-level optimization
-    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + s];
+    // Block 內 Reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            cache[tid] += cache[tid + s];
         }
         __syncthreads();
     }
     
-    // Warp-level reduction (no __syncthreads needed within a warp)
-    if (threadIdx.x < 32) {
-        volatile double* vshared = shared_sum;
-        vshared[threadIdx.x] += vshared[threadIdx.x + 32];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 16];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 8];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 4];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 2];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 1];
-    }
-    
-    // Write block result
-    if (threadIdx.x == 0) {
-        block_results[blockIdx.x] = shared_sum[0];
-    }
+    if (tid == 0) *result = cache[0];
 }
 
-// Kernel to reduce block results to a single value
-__global__ void reduce_blocks_kernel(double* block_results, double* final_result, int num_blocks) {
-    __shared__ double shared_sum[BLOCK_SIZE];
-    
-    double sum = 0.0;
-    for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
-        sum += block_results[i];
-    }
-    
-    shared_sum[threadIdx.x] = sum;
-    __syncthreads();
-    
-    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-    
-    if (threadIdx.x < 32) {
-        volatile double* vshared = shared_sum;
-        vshared[threadIdx.x] += vshared[threadIdx.x + 32];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 16];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 8];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 4];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 2];
-        vshared[threadIdx.x] += vshared[threadIdx.x + 1];
-    }
-    
-    if (threadIdx.x == 0) {
-        *final_result = shared_sum[0];
-    }
-}
-
-// Kernel to normalize a vector
-__global__ void normalize_kernel(double* vec, double mag, int n) {
+// ----------------------------------------------------------------------
+// Kernel 2: 正規化 (Normalize)
+// 讀取 GPU 上的 norm_squared 結果，計算 sqrt 並除以它
+// ----------------------------------------------------------------------
+__global__ void normalize_vector_kernel(double* vec, const double* norm_sq_ptr, int n) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    
+    // 讀取長度並開根號 (只有第一個 Thread 需要讀，但為了簡單讓大家讀取到 Shared 或是直接讀 Global)
+    // 考慮到讀取次數極少，直接讀 Global 即可
+    double mag = sqrt(*norm_sq_ptr);
+    
+    // 避免除以 0
+    if (mag < 1e-9) return; 
+
     if (idx < n) {
         vec[idx] /= mag;
     }
 }
 
-// Kernel to compute projection and subtract: v_j -= (dot(v_j, v_i)) * v_i
-__global__ void orthogonalize_kernel(double* v_j, const double* v_i, double proj, int n) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < n) {
-        v_j[idx] -= proj * v_i[idx];
+// ----------------------------------------------------------------------
+// Kernel 3: 批次計算投影量 (Batch Dot Product)
+// Grid.x 代表剩下的向量數量 (j = i+1 ... n-1)
+// 每個 Block 負責計算一個 dot(v_j, v_i)
+// ----------------------------------------------------------------------
+__global__ void batch_dot_product_kernel(const double* all_vectors, double* projections, 
+                                         int current_i, int n, int num_remaining) {
+    // blockIdx.x 對應到 "第幾個剩下的向量"
+    int j_offset = blockIdx.x; 
+    if (j_offset >= num_remaining) return;
+
+    int target_j_index = current_i + 1 + j_offset; // 實際的向量索引 j
+
+    const double* v_i = all_vectors + current_i * n;      // 基準向量
+    const double* v_j = all_vectors + target_j_index * n; // 目標向量
+
+    __shared__ double cache[BLOCK_SIZE];
+    int tid = threadIdx.x;
+    double temp_sum = 0.0;
+
+    // 計算 dot(v_j, v_i)
+    for (int k = tid; k < n; k += blockDim.x) {
+        temp_sum += v_j[k] * v_i[k];
+    }
+
+    cache[tid] = temp_sum;
+    __syncthreads();
+
+    // Reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            cache[tid] += cache[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // 寫入結果到 projections 陣列
+    if (tid == 0) {
+        projections[j_offset] = cache[0];
     }
 }
 
-// Structure to hold pre-allocated GPU resources
-struct GpuResources {
-    double* d_block_results;
-    double* d_final_result;
-    int max_blocks;
+// ----------------------------------------------------------------------
+// Kernel 4: 批次更新向量 (Batch Update)
+// v_j = v_j - proj * v_i
+// Grid 2D: X=向量元素分塊, Y=剩下的向量數量
+// ----------------------------------------------------------------------
+__global__ void batch_update_kernel(double* all_vectors, const double* projections, 
+                                    int current_i, int n, int num_remaining) {
     
-    GpuResources(int n) {
-        max_blocks = min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, MAX_BLOCKS);
-        CUDA_CHECK(cudaMalloc(&d_block_results, max_blocks * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&d_final_result, sizeof(double)));
-    }
-    
-    ~GpuResources() {
-        cudaFree(d_block_results);
-        cudaFree(d_final_result);
-    }
-};
+    int j_offset = blockIdx.y; // 第幾個剩下的向量
+    if (j_offset >= num_remaining) return;
 
-double dot_product_gpu(const double* d_a, const double* d_b, int n, GpuResources& res) {
-    int num_blocks = min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, res.max_blocks);
+    int idx = threadIdx.x + blockIdx.x * blockDim.x; // 向量內的元素索引
+    if (idx >= n) return;
+
+    int target_j_index = current_i + 1 + j_offset;
     
-    dot_product_kernel<<<num_blocks, BLOCK_SIZE>>>(d_a, d_b, res.d_block_results, n, num_blocks);
-    reduce_blocks_kernel<<<1, BLOCK_SIZE>>>(res.d_block_results, res.d_final_result, num_blocks);
+    double proj = projections[j_offset]; // 讀取剛才算好的投影量
     
-    double result;
-    CUDA_CHECK(cudaMemcpy(&result, res.d_final_result, sizeof(double), cudaMemcpyDeviceToHost));
-    
-    return result;
+    double* v_i = all_vectors + current_i * n;
+    double* v_j = all_vectors + target_j_index * n;
+
+    v_j[idx] -= proj * v_i[idx];
 }
 
+// ----------------------------------------------------------------------
+// Main Host Code
+// ----------------------------------------------------------------------
 int main(int argc, char* argv[]) {
     std::chrono::steady_clock::time_point total_start = std::chrono::steady_clock::now();
+
     if (argc != 3) {
         std::cerr << "Usage: " << argv[0] << " <input_file> <output_file>" << std::endl;
         return 1;
@@ -153,112 +150,102 @@ int main(int argc, char* argv[]) {
     std::string input_path = argv[1];
     std::string output_path = argv[2];
 
+    // 1. Read Input
     std::ifstream infile(input_path);
     if (!infile.is_open()) {
-        std::cerr << "Error opening input file: " << input_path << std::endl;
+        std::cerr << "Error opening input file." << std::endl;
         return 1;
     }
 
     int n;
-    if (!(infile >> n)) {
-        std::cerr << "Error reading number of vectors." << std::endl;
-        return 1;
-    }
-
-    std::vector<std::vector<double>> vectors(n, std::vector<double>(n));
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            infile >> vectors[i][j];
-        }
+    infile >> n;
+    
+    // 使用一維陣列儲存矩陣 (Row-Major: 每個向量 v_i 連續儲存)
+    std::vector<double> h_vectors(n * n);
+    for (int i = 0; i < n * n; ++i) {
+        infile >> h_vectors[i];
     }
     infile.close();
 
-    // Allocate device memory for vectors (stored as flat array)
-    double* d_vectors;
-    size_t vector_bytes = (size_t)n * n * sizeof(double);
-    CUDA_CHECK(cudaMalloc(&d_vectors, vector_bytes));
+    // 2. Allocate GPU Memory
+    double *d_vectors, *d_projections, *d_temp_norm;
+    size_t vec_size = n * n * sizeof(double);
     
-    // Copy vectors to device
-    std::vector<double> flat_vectors(n * n);
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            flat_vectors[i * n + j] = vectors[i][j];
-        }
-    }
-    CUDA_CHECK(cudaMemcpy(d_vectors, flat_vectors.data(), vector_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_vectors, vec_size));
+    CUDA_CHECK(cudaMalloc(&d_projections, n * sizeof(double))); // 暫存投影係數
+    CUDA_CHECK(cudaMalloc(&d_temp_norm, sizeof(double)));       // 暫存 Norm
 
-    // Pre-allocate GPU resources for dot product operations
-    GpuResources gpuRes(n);
-    
-    std::chrono::steady_clock::time_point computation_start = std::chrono::steady_clock::now();
+    // 3. H2D Copy
+    std::chrono::steady_clock::time_point H2D_start = std::chrono::steady_clock::now();
+    CUDA_CHECK(cudaMemcpy(d_vectors, h_vectors.data(), vec_size, cudaMemcpyHostToDevice));
+    std::chrono::steady_clock::time_point H2D_end = std::chrono::steady_clock::now();
 
-    int num_blocks = min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, MAX_BLOCKS);
-    
-    // Modified Gram-Schmidt on GPU
+    // 4. MGS Loop on GPU
+    std::chrono::steady_clock::time_point comp_start = std::chrono::steady_clock::now();
+
     for (int i = 0; i < n; ++i) {
-        double* d_vec_i = d_vectors + i * n;
+        // --- Step A: Normalize v_i ---
+        // 1. 計算 v_i . v_i
+        single_vector_norm_squared_kernel<<<1, BLOCK_SIZE>>>(d_vectors + i * n, d_temp_norm, n);
         
-        // Compute magnitude of vector i
-        double dot_i_i = dot_product_gpu(d_vec_i, d_vec_i, n, gpuRes);
-        double mag = std::sqrt(dot_i_i);
+        // 2. 正規化 v_i (讀取 d_temp_norm 並更新 d_vectors)
+        // 使用足夠的 Blocks 來覆蓋長度 n
+        int num_blocks_norm = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        normalize_vector_kernel<<<num_blocks_norm, BLOCK_SIZE>>>(d_vectors + i * n, d_temp_norm, n);
+
+        // --- Step B: Orthogonalize rest (Batch Processing) ---
+        int num_remaining = n - (i + 1);
         
-        if (mag > 1e-9) {
-            // Normalize vector i
-            normalize_kernel<<<num_blocks, BLOCK_SIZE>>>(d_vec_i, mag, n);
-        }
-        
-        // Orthogonalize remaining vectors
-        for (int j = i + 1; j < n; ++j) {
-            double* d_vec_j = d_vectors + j * n;
-            
-            // Compute projection: proj = dot(v_j, v_i)
-            double proj = dot_product_gpu(d_vec_j, d_vec_i, n, gpuRes);
-            
-            // Subtract projection: v_j -= proj * v_i
-            orthogonalize_kernel<<<num_blocks, BLOCK_SIZE>>>(d_vec_j, d_vec_i, proj, n);
+        if (num_remaining > 0) {
+            // 3. 一次計算所有 dot(v_j, v_i) for j > i
+            // Grid 大小 = 剩下的向量數，每個 Block 算一個向量
+            batch_dot_product_kernel<<<num_remaining, BLOCK_SIZE>>>(d_vectors, d_projections, i, n, num_remaining);
+
+            // 4. 一次更新所有 v_j = v_j - proj * v_i
+            // Grid X = 向量長度分塊, Grid Y = 向量數量
+            dim3 grid_update((n + BLOCK_SIZE - 1) / BLOCK_SIZE, num_remaining);
+            batch_update_kernel<<<grid_update, BLOCK_SIZE>>>(d_vectors, d_projections, i, n, num_remaining);
         }
     }
     
-    // Synchronize after all kernel launches
     CUDA_CHECK(cudaDeviceSynchronize());
+    std::chrono::steady_clock::time_point comp_end = std::chrono::steady_clock::now();
 
-    std::chrono::steady_clock::time_point computation_end = std::chrono::steady_clock::now();
-    std::chrono::duration<double> elapsed_seconds = computation_end - computation_start;
+    // 5. D2H Copy
+    std::chrono::steady_clock::time_point D2H_start = std::chrono::steady_clock::now();
+    CUDA_CHECK(cudaMemcpy(h_vectors.data(), d_vectors, vec_size, cudaMemcpyDeviceToHost));
+    std::chrono::steady_clock::time_point D2H_end = std::chrono::steady_clock::now();
 
-    // Copy results back to host
-    CUDA_CHECK(cudaMemcpy(flat_vectors.data(), d_vectors, vector_bytes, cudaMemcpyDeviceToHost));
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            vectors[i][j] = flat_vectors[i * n + j];
-        }
-    }
-
-    CUDA_CHECK(cudaFree(d_vectors));
-
-    // Write output
+    // 6. Output to File
     std::ofstream outfile(output_path);
-    if (!outfile.is_open()) {
-        std::cerr << "Error opening output file: " << output_path << std::endl;
-        return 1;
-    }
-
     outfile << n << std::endl;
     outfile << std::fixed << std::setprecision(6);
+    
+    // 注意：原本的 vector<vector> 轉成了一維，輸出時要控制換行
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < n; ++j) {
-            outfile << vectors[i][j] << (j == n - 1 ? "" : " ");
+            outfile << h_vectors[i * n + j] << (j == n - 1 ? "" : " ");
         }
         outfile << std::endl;
     }
     outfile.close();
 
-    std::chrono::steady_clock::time_point total_end = std::chrono::steady_clock::now();
-    std::chrono::duration<double> total_elapsed_seconds = total_end - total_start;
-    
-    std::cout << "Computation Time: " << elapsed_seconds.count() << "s" << std::endl;
-    std::cout << "Total Time: " << total_elapsed_seconds.count() << "s" << std::endl;
-    std::cout << "Compute-To-Total Time Ratio: " << (elapsed_seconds.count() / total_elapsed_seconds.count()) << std::endl;
-    std::cout << "Output written to: " << output_path << std::endl;
+    // Cleanup
+    cudaFree(d_vectors);
+    cudaFree(d_projections);
+    cudaFree(d_temp_norm);
+
+    // Timing Report
+    std::chrono::duration<double> total_time = std::chrono::steady_clock::now() - total_start;
+    std::chrono::duration<double> comp_time = comp_end - comp_start;
+    std::chrono::duration<double> h2d_time = H2D_end - H2D_start;
+    std::chrono::duration<double> d2h_time = D2H_end - D2H_start;
+
+    std::cout << "Computation Time: " << comp_time.count() << "s" << std::endl;
+    std::cout << "H2D Time: " << h2d_time.count() << "s" << std::endl;
+    std::cout << "D2H Time: " << d2h_time.count() << "s" << std::endl;
+    std::cout << "Total Time: " << total_time.count() << "s" << std::endl;
+    std::cout << "Ratio: " << comp_time.count() / total_time.count() << std::endl;
 
     return 0;
 }
